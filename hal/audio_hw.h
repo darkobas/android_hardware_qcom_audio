@@ -68,6 +68,8 @@ typedef enum {
     USECASE_AUDIO_PLAYBACK_LOW_LATENCY,
     USECASE_AUDIO_PLAYBACK_MULTI_CH,
     USECASE_AUDIO_PLAYBACK_OFFLOAD,
+    USECASE_AUDIO_PLAYBACK_ULL,
+
 #ifdef MULTIPLE_OFFLOAD_ENABLED
     USECASE_AUDIO_PLAYBACK_OFFLOAD2,
     USECASE_AUDIO_PLAYBACK_OFFLOAD3,
@@ -83,7 +85,6 @@ typedef enum {
 
     /* FM usecase */
     USECASE_AUDIO_PLAYBACK_FM,
-    USECASE_AUDIO_PLAYBACK_ULL,
 
     /* HFP Use case*/
     USECASE_AUDIO_HFP_SCO,
@@ -191,6 +192,8 @@ struct stream_out {
     void *offload_cookie;
     struct compr_gapless_mdata gapless_mdata;
     int send_new_metadata;
+    bool send_next_track_params;
+    bool is_compr_metadata_avail;
     unsigned int bit_width;
 
     struct audio_device *dev;

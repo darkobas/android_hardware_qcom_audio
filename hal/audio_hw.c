@@ -65,8 +65,10 @@
 
 #ifdef LOW_LATENCY_PRIMARY
 #define USECASE_AUDIO_PLAYBACK_PRIMARY USECASE_AUDIO_PLAYBACK_LOW_LATENCY
+#define PCM_CONFIG_AUDIO_PLAYBACK_PRIMARY pcm_config_low_latency
 #else
 #define USECASE_AUDIO_PLAYBACK_PRIMARY USECASE_AUDIO_PLAYBACK_DEEP_BUFFER
+#define PCM_CONFIG_AUDIO_PLAYBACK_PRIMARY pcm_config_deep_buffer
 #endif
 
 static unsigned int configured_low_latency_capture_period_size =
@@ -153,6 +155,7 @@ const char * const use_case_table[AUDIO_USECASE_MAX] = {
     [USECASE_AUDIO_PLAYBACK_LOW_LATENCY] = "low-latency-playback",
     [USECASE_AUDIO_PLAYBACK_MULTI_CH] = "multi-channel-playback",
     [USECASE_AUDIO_PLAYBACK_OFFLOAD] = "compress-offload-playback",
+    [USECASE_AUDIO_PLAYBACK_ULL] = "audio-ull-playback",
 #ifdef MULTIPLE_OFFLOAD_ENABLED
     [USECASE_AUDIO_PLAYBACK_OFFLOAD2] = "compress-offload-playback2",
     [USECASE_AUDIO_PLAYBACK_OFFLOAD3] = "compress-offload-playback3",
@@ -164,7 +167,6 @@ const char * const use_case_table[AUDIO_USECASE_MAX] = {
     [USECASE_AUDIO_PLAYBACK_OFFLOAD9] = "compress-offload-playback9",
 #endif
     [USECASE_AUDIO_DIRECT_PCM_OFFLOAD] = "compress-offload-playback2",
-    [USECASE_AUDIO_PLAYBACK_ULL] = "audio-ull-playback",
     [USECASE_AUDIO_RECORD] = "audio-record",
     [USECASE_AUDIO_RECORD_COMPRESS] = "audio-record-compress",
     [USECASE_AUDIO_RECORD_LOW_LATENCY] = "low-latency-record",
@@ -1329,15 +1331,13 @@ static void *offload_thread_loop(void *context)
             else
                 ALOGE("%s: Next track returned error %d",__func__, ret);
 
-            if (ret != -ENETRESET) {
-                send_callback = true;
-                event = STREAM_CBK_EVENT_DRAIN_READY;
-
-                /* Resend the metadata for next iteration */
-                out->send_new_metadata = 1;
-                ALOGV("copl(%p):send drain callback, ret %d", out, ret);
-            } else
-                ALOGE("%s: Block drain ready event during SSR", __func__);
+            send_callback = true;
+            event = STREAM_CBK_EVENT_DRAIN_READY;
+            pthread_mutex_lock(&out->lock);
+            /* Resend the metadata for next iteration */
+            out->send_new_metadata = 1;
+            out->send_next_track_params = true;
+            pthread_mutex_unlock(&out->lock);
             break;
         case OFFLOAD_CMD_DRAIN:
             ALOGV("copl(%x):calling compress_drain", (unsigned int)out);
@@ -1630,6 +1630,9 @@ int start_output_stream(struct stream_out *out)
             ret = -EIO;
             goto error_open;
         }
+        /* compress_open sends params of the track, so reset the flag here */
+        out->is_compr_metadata_avail = false;
+
         if (out->offload_callback)
             compress_nonblock(out->compr, out->non_blocking);
 
@@ -1802,6 +1805,8 @@ static int out_standby(struct audio_stream *stream)
         } else {
             ALOGD("copl(%x):standby", (unsigned int)out);
             stop_compressed_output_l(out);
+            out->send_next_track_params = false;
+            out->is_compr_metadata_avail = false;
             out->gapless_mdata.encoder_delay = 0;
             out->gapless_mdata.encoder_padding = 0;
             if (out->compr != NULL) {
@@ -1827,10 +1832,6 @@ static int parse_compress_metadata(struct stream_out *out, struct str_parms *par
 {
     int ret = 0;
     char value[32];
-    bool is_meta_data_params = false;
-    struct compr_gapless_mdata tmp_mdata;
-    tmp_mdata.encoder_delay = 0;
-    tmp_mdata.encoder_padding = 0;
 
     if (!out || !parms) {
         ALOGE("%s: return invalid ",__func__);
@@ -1843,101 +1844,18 @@ static int parse_compress_metadata(struct stream_out *out, struct str_parms *par
             out->compr_config.codec->format = SND_AUDIOSTREAMFORMAT_MP4ADTS;
             ALOGV("ADTS format is set in offload mode");
         }
-        out->send_new_metadata = 1;
     }
-
-#ifdef FLAC_OFFLOAD_ENABLED
-    if (out->format == AUDIO_FORMAT_FLAC) {
-        ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_FLAC_MIN_BLK_SIZE, value, sizeof(value));
-        if (ret >= 0) {
-            out->compr_config.codec->options.flac_dec.min_blk_size = atoi(value);
-            out->send_new_metadata = 1;
-        }
-        ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_FLAC_MAX_BLK_SIZE, value, sizeof(value));
-        if (ret >= 0) {
-            out->compr_config.codec->options.flac_dec.max_blk_size = atoi(value);
-            out->send_new_metadata = 1;
-        }
-        ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_FLAC_MIN_FRAME_SIZE, value, sizeof(value));
-        if (ret >= 0) {
-            out->compr_config.codec->options.flac_dec.min_frame_size = atoi(value);
-            out->send_new_metadata = 1;
-        }
-        ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_FLAC_MAX_FRAME_SIZE, value, sizeof(value));
-        if (ret >= 0) {
-            out->compr_config.codec->options.flac_dec.max_frame_size = atoi(value);
-            out->send_new_metadata = 1;
-        }
-    }
-#endif
-
-    ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_SAMPLE_RATE, value, sizeof(value));
-    if(ret >= 0)
-        is_meta_data_params = true;
-    ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_NUM_CHANNEL, value, sizeof(value));
-    if(ret >= 0 )
-        is_meta_data_params = true;
-    ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_AVG_BIT_RATE, value, sizeof(value));
-    if(ret >= 0 )
-        is_meta_data_params = true;
     ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_DELAY_SAMPLES, value, sizeof(value));
     if (ret >= 0) {
-        is_meta_data_params = true;
-        tmp_mdata.encoder_delay = atoi(value); //whats a good limit check?
+        out->gapless_mdata.encoder_delay = atoi(value); //whats a good limit check?
     }
     ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_PADDING_SAMPLES, value, sizeof(value));
     if (ret >= 0) {
-        is_meta_data_params = true;
-        tmp_mdata.encoder_padding = atoi(value);
+        out->gapless_mdata.encoder_padding = atoi(value);
     }
 
-    if(!is_meta_data_params) {
-        ALOGV("%s: Not gapless meta data params", __func__);
-        return 0;
-    }
-    out->gapless_mdata = tmp_mdata;
-    out->send_new_metadata = 1;
     ALOGV("%s new encoder delay %u and padding %u", __func__,
           out->gapless_mdata.encoder_delay, out->gapless_mdata.encoder_padding);
-
-    if(out->format == AUDIO_FORMAT_WMA || out->format == AUDIO_FORMAT_WMA_PRO) {
-        ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_WMA_FORMAT_TAG, value, sizeof(value));
-        if (ret >= 0) {
-            out->compr_config.codec->format = atoi(value);
-        }
-       ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_WMA_BLOCK_ALIGN, value, sizeof(value));
-        if (ret >= 0) {
-            out->compr_config.codec->options.wma.super_block_align = atoi(value);
-        }
-        ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_WMA_BIT_PER_SAMPLE, value, sizeof(value));
-        if (ret >= 0) {
-            out->compr_config.codec->options.wma.bits_per_sample = atoi(value);
-        }
-        ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_WMA_CHANNEL_MASK, value, sizeof(value));
-        if (ret >= 0) {
-            out->compr_config.codec->options.wma.channelmask = atoi(value);
-        }
-        ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_WMA_ENCODE_OPTION, value, sizeof(value));
-        if (ret >= 0) {
-            out->compr_config.codec->options.wma.encodeopt = atoi(value);
-        }
-        ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_WMA_ENCODE_OPTION1, value, sizeof(value));
-        if (ret >= 0) {
-            out->compr_config.codec->options.wma.encodeopt1 = atoi(value);
-        }
-        ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_WMA_ENCODE_OPTION2, value, sizeof(value));
-        if (ret >= 0) {
-            out->compr_config.codec->options.wma.encodeopt2 = atoi(value);
-        }
-        ALOGV("WMA params: fmt %x, balgn %x, sr %d, chmsk %x, encop %x, op1 %x, op2 %x",
-                                out->compr_config.codec->format,
-                                out->compr_config.codec->options.wma.super_block_align,
-                                out->compr_config.codec->options.wma.bits_per_sample,
-                                out->compr_config.codec->options.wma.channelmask,
-                                out->compr_config.codec->options.wma.encodeopt,
-                                out->compr_config.codec->options.wma.encodeopt1,
-                                out->compr_config.codec->options.wma.encodeopt2);
-    }
 
     return 0;
 }
@@ -2195,6 +2113,12 @@ static ssize_t out_write(struct audio_stream_out *stream, const void *buffer,
             ALOGD("copl(%x):send new gapless metadata", (unsigned int)out);
             compress_set_gapless_metadata(out->compr, &out->gapless_mdata);
             out->send_new_metadata = 0;
+            if (out->send_next_track_params && out->is_compr_metadata_avail) {
+                ALOGD("copl(%p):send next track params in gapless", out);
+                compress_set_next_track_param(out->compr, &(out->compr_config.codec->options));
+                out->send_next_track_params = false;
+                out->is_compr_metadata_avail = false;
+            }
         }
 
         ret = compress_write(out->compr, buffer, bytes);
@@ -2263,9 +2187,13 @@ static int out_get_render_position(const struct audio_stream_out *stream,
                                    uint32_t *dsp_frames)
 {
     struct stream_out *out = (struct stream_out *)stream;
-    if (is_offload_usecase(out->usecase) && (dsp_frames != NULL)) {
-        ssize_t ret =  0;
-        *dsp_frames = 0;
+
+    if (dsp_frames == NULL)
+        return -EINVAL;
+
+    *dsp_frames = 0;
+    if (is_offload_usecase(out->usecase)) {
+        ssize_t ret = 0;
         lock_output_stream(out);
         if (out->compr != NULL) {
             ret = compress_get_tstamp(out->compr, (unsigned long *)dsp_frames,
@@ -2281,14 +2209,14 @@ static int out_get_render_position(const struct audio_stream_out *stream,
             set_snd_card_state(adev,SND_CARD_STATE_OFFLINE);
             return -EINVAL;
         } else if(ret < 0) {
-            if (out->compr == NULL) {
-                return 0;
-            }
             ALOGE(" ERROR: Unable to get time stamp from compress driver ret=%d", ret);
             return -EINVAL;
         } else {
             return 0;
         }
+    } else if (audio_is_linear_pcm(out->format)) {
+        *dsp_frames = out->written;
+        return 0;
     } else
         return -EINVAL;
 }
@@ -2767,7 +2695,6 @@ static int adev_open_output_stream(struct audio_hw_device *dev,
     struct audio_device *adev = (struct audio_device *)dev;
     struct stream_out *out;
     int i, ret = 0;
-    int32_t sample_rate = DEFAULT_OUTPUT_SAMPLING_RATE;
 
     *stream_out = NULL;
 
@@ -2879,6 +2806,12 @@ static int adev_open_output_stream(struct audio_hw_device *dev,
         } else {
             ALOGV("%s:: inserting OFFLOAD_USECASE", __func__);
             out->usecase = get_offload_usecase(adev);
+
+            out->stream.set_callback = out_set_callback;
+            out->stream.pause = out_pause;
+            out->stream.resume = out_resume;
+            out->stream.drain = out_drain;
+            out->stream.flush = out_flush;
         }
         if (config->offload_info.channel_mask)
             out->channel_mask = config->offload_info.channel_mask;
@@ -2889,11 +2822,6 @@ static int adev_open_output_stream(struct audio_hw_device *dev,
         out->format = config->offload_info.format;
         out->sample_rate = config->offload_info.sample_rate;
 
-        out->stream.set_callback = out_set_callback;
-        out->stream.pause = out_pause;
-        out->stream.resume = out_resume;
-        out->stream.drain = out_drain;
-        out->stream.flush = out_flush;
         out->bit_width = CODEC_BACKEND_DEFAULT_BIT_WIDTH;
 
         if (audio_extn_is_dolby_format(config->offload_info.format))
@@ -2924,7 +2852,9 @@ static int adev_open_output_stream(struct audio_hw_device *dev,
         out->compr_config.codec->ch_in =
                     audio_channel_count_from_out_mask(config->channel_mask);
         out->compr_config.codec->ch_out = out->compr_config.codec->ch_in;
-        out->bit_width = config->offload_info.bit_width;
+        out->bit_width = AUDIO_OUTPUT_BIT_WIDTH;
+        /*TODO: Do we need to change it for passthrough */
+        out->compr_config.codec->format = SND_AUDIOSTREAMFORMAT_RAW;
 
         if ((config->offload_info.format & AUDIO_FORMAT_MAIN_MASK) == AUDIO_FORMAT_AAC)
             out->compr_config.codec->format = SND_AUDIOSTREAMFORMAT_RAW;
@@ -2940,7 +2870,7 @@ static int adev_open_output_stream(struct audio_hw_device *dev,
 
 #ifdef FLAC_OFFLOAD_ENABLED
         if (config->offload_info.format == AUDIO_FORMAT_FLAC)
-            out->compr_config.codec->options.flac_dec.sample_size = config->offload_info.bit_width;
+            out->compr_config.codec->options.flac_dec.sample_size = AUDIO_OUTPUT_BIT_WIDTH;
 #endif
 
         if (flags & AUDIO_OUTPUT_FLAG_NON_BLOCKING)
@@ -2956,6 +2886,8 @@ static int adev_open_output_stream(struct audio_hw_device *dev,
         }
 
         out->send_new_metadata = 1;
+        out->send_next_track_params = false;
+        out->is_compr_metadata_avail = false;
         out->offload_state = OFFLOAD_STATE_IDLE;
         out->playback_started = 0;
 
@@ -2998,28 +2930,21 @@ static int adev_open_output_stream(struct audio_hw_device *dev,
         out->config = pcm_config_afe_proxy_playback;
         adev->voice_tx_output = out;
     } else {
-#ifndef LOW_LATENCY_PRIMARY
-        if (out->flags & AUDIO_OUTPUT_FLAG_FAST) {
-            out->usecase = USECASE_AUDIO_PLAYBACK_LOW_LATENCY;
-            out->config = pcm_config_low_latency;
-#endif
-#ifdef LOW_LATENCY_PRIMARY
         if (out->flags & AUDIO_OUTPUT_FLAG_DEEP_BUFFER) {
             out->usecase = USECASE_AUDIO_PLAYBACK_DEEP_BUFFER;
             out->config = pcm_config_deep_buffer;
-#endif
         } else if (out->flags & AUDIO_OUTPUT_FLAG_RAW) {
             out->usecase = USECASE_AUDIO_PLAYBACK_ULL;
+            out->config = pcm_config_low_latency;
+        } else if (out->flags & AUDIO_OUTPUT_FLAG_FAST) {
+            out->usecase = USECASE_AUDIO_PLAYBACK_LOW_LATENCY;
             out->config = pcm_config_low_latency;
         } else {
             /* primary path is the default path selected if no other outputs are available/suitable */
             out->usecase = USECASE_AUDIO_PLAYBACK_PRIMARY;
-#ifdef LOW_LATENCY_PRIMARY
-            out->config = pcm_config_low_latency;
-#else
-            out->config = pcm_config_deep_buffer;
-#endif
+            out->config = PCM_CONFIG_AUDIO_PLAYBACK_PRIMARY;
         }
+
         if (config->format != audio_format_from_pcm_format(out->config.format)) {
             if (k_enable_extended_precision
                     && pcm_params_format_test(adev->use_case_table[out->usecase],
@@ -3040,8 +2965,8 @@ static int adev_open_output_stream(struct audio_hw_device *dev,
         out->sample_rate = out->config.rate;
     }
 
-    ALOGV("%s flags %x, format %x, sample_rate %d, out->bit_width %d",
-           __func__, flags, out->format, out->sample_rate, out->bit_width);
+    ALOGV("%s devices %d,flags %x, format %x, out->sample_rate %d, out->bit_width %d",
+           __func__, devices, flags, out->format, out->sample_rate, out->bit_width);
 
     if ((out->usecase == USECASE_AUDIO_PLAYBACK_PRIMARY) ||
             flags & AUDIO_OUTPUT_FLAG_PRIMARY) {
@@ -3737,7 +3662,11 @@ static int adev_close(hw_device_t *device)
 static int period_size_is_plausible_for_low_latency(int period_size)
 {
     switch (period_size) {
+    case 48:
+    case 96:
+    case 144:
     case 160:
+    case 192:
     case 240:
     case 320:
     case 480:
